@@ -1,6 +1,6 @@
-const { createClient } = require("@supabase/supabase-js");
+import { createClient } from "@supabase/supabase-js";
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   try {
     if (req.method !== "POST") {
       return res.status(200).json({
@@ -37,9 +37,7 @@ module.exports = async function handler(req, res) {
 
     await supabase
       .from("keys")
-      .update({
-        last_used: new Date().toISOString()
-      })
+      .update({ last_used: new Date().toISOString() })
       .eq("id", data.id);
 
     return res.status(200).json({ valid: true });
@@ -49,4 +47,4 @@ module.exports = async function handler(req, res) {
       error: err.message
     });
   }
-};
+}
