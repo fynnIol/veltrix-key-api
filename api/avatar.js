@@ -1,76 +1,82 @@
 // api/avatar.js
-// Vercel serverless function for rendering a temporary Roblox avatar thumbnail.
-//
-// Required Vercel environment variables:
-//   ROBLOX_COOKIE   = only the value of your .ROBLOSECURITY cookie
-//   AVATAR_API_KEY  = a private key sent by your Discord bot/executor in x-api-key
-//
-// Request example:
-//   GET /api/avatar?userId=11308770201&accessories=123,456
-//   Header: x-api-key: YOUR_PRIVATE_KEY
+// looks up a saved avatar ID, asks Roblox for a temporary render,
+// and returns the raw image to the Discord bot
+
+import { timingSafeEqual } from "node:crypto";
+import { createClient } from "@supabase/supabase-js";
 
 const ROBLOX_AVATAR_API = "https://avatar.roblox.com";
-const MAX_EXTRA_ASSETS = 8;
+const MAX_ACCESSORIES = 8;
 const RENDER_SIZE = "420x420";
-const MAX_RENDER_ATTEMPTS = 25;
-const POLL_DELAY_MS = 900;
+const MAX_RENDER_ATTEMPTS = 22;
+const POLL_DELAY_MS = 700;
+const HEADLESS_HEAD_ID = 134082579;
+const KORBLOX_RIGHT_LEG_ID = 139607718;
 
-// Reused while the Vercel function instance stays warm.
 let cachedCsrfToken = "";
 let cachedRobloxCookie = "";
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-function firstValue(value) {
-  return Array.isArray(value) ? value[0] : value;
+function getSupabase() {
+  const url = process.env.SUPABASE_URL;
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  if (!url || !serviceRoleKey) {
+    throw new Error(
+      "SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY is missing"
+    );
+  }
+
+  return createClient(url, serviceRoleKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
 }
 
-function parsePositiveInteger(value) {
-  const text = String(firstValue(value) ?? "").trim();
+function constantTimeEquals(leftValue, rightValue) {
+  const left = Buffer.from(String(leftValue || ""));
+  const right = Buffer.from(String(rightValue || ""));
 
-  if (!/^\d+$/.test(text)) {
-    return null;
+  if (left.length !== right.length || left.length === 0) {
+    return false;
   }
 
-  const number = Number(text);
-
-  if (!Number.isSafeInteger(number) || number <= 0) {
-    return null;
-  }
-
-  return number;
+  return timingSafeEqual(left, right);
 }
 
-function parseAccessoryIds(value) {
-  const matches = String(firstValue(value) ?? "").match(/\d+/g) ?? [];
-  const uniqueIds = [];
+function isAuthorized(req) {
+  const configuredKey = String(process.env.AVATAR_API_KEY || "");
 
-  for (const match of matches) {
-    const id = Number(match);
-
-    if (!Number.isSafeInteger(id) || id <= 0 || uniqueIds.includes(id)) {
-      continue;
-    }
-
-    uniqueIds.push(id);
-
-    if (uniqueIds.length >= MAX_EXTRA_ASSETS) {
-      break;
-    }
+  if (!configuredKey) {
+    throw new Error(
+      "AVATAR_API_KEY is missing from Vercel environment variables"
+    );
   }
 
-  return uniqueIds;
+  return constantTimeEquals(
+    req.headers["x-api-key"],
+    configuredKey
+  );
+}
+
+function setCorsHeaders(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, x-api-key"
+  );
 }
 
 function normalizeCookie(rawCookie) {
-  let cookie = String(rawCookie ?? "").trim();
-
-  // Allows either the raw value or `.ROBLOSECURITY=value` to be pasted.
+  let cookie = String(rawCookie || "").trim();
   cookie = cookie.replace(/^\.ROBLOSECURITY\s*=\s*/i, "");
 
-  // Removes an accidental Cookie-header suffix.
   const semicolonIndex = cookie.indexOf(";");
   if (semicolonIndex !== -1) {
     cookie = cookie.slice(0, semicolonIndex).trim();
@@ -85,7 +91,9 @@ function currentRobloxCookie() {
   );
 
   if (!cookie) {
-    throw new Error("ROBLOX_COOKIE is missing from Vercel environment variables");
+    throw new Error(
+      "ROBLOX_COOKIE is missing from Vercel environment variables"
+    );
   }
 
   return cookie;
@@ -95,28 +103,24 @@ function robloxCookieHeader() {
   return `.ROBLOSECURITY=${currentRobloxCookie()}`;
 }
 
-function captureRotatedRobloxCookie(response) {
-  const setCookieHeaders =
+function captureRotatedCookie(response) {
+  const headers =
     typeof response.headers.getSetCookie === "function"
       ? response.headers.getSetCookie()
       : [response.headers.get("set-cookie")].filter(Boolean);
 
-  for (const header of setCookieHeaders) {
+  for (const header of headers) {
     const match = String(header).match(/\.ROBLOSECURITY=([^;]+)/i);
 
-    if (!match?.[1]) {
-      continue;
+    if (match?.[1]) {
+      const nextCookie = normalizeCookie(match[1]);
+
+      if (nextCookie) {
+        const changed = nextCookie !== currentRobloxCookie();
+        cachedRobloxCookie = nextCookie;
+        return changed;
+      }
     }
-
-    const rotatedCookie = normalizeCookie(match[1]);
-
-    if (!rotatedCookie) {
-      continue;
-    }
-
-    const changed = rotatedCookie !== currentRobloxCookie();
-    cachedRobloxCookie = rotatedCookie;
-    return changed;
   }
 
   return false;
@@ -147,6 +151,51 @@ function robloxErrorMessage(data, fallback) {
   );
 }
 
+function parseAvatarId(value) {
+  const id = String(value || "").trim().toUpperCase();
+  return /^AV-[A-Z0-9]{10}$/.test(id) ? id : null;
+}
+
+async function loadSavedAvatar(id) {
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from("saved_avatars")
+    .select(
+      "id,user_id,accessories,headless,korblox,pose"
+    )
+    .eq("id", id)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+
+  if (!data) {
+    return null;
+  }
+
+  const accessories = Array.isArray(data.accessories)
+    ? data.accessories
+        .map(Number)
+        .filter(
+          (value, index, array) =>
+            Number.isSafeInteger(value) &&
+            value > 0 &&
+            array.indexOf(value) === index
+        )
+        .slice(0, MAX_ACCESSORIES)
+    : [];
+
+  return {
+    id: data.id,
+    userId: Number(data.user_id),
+    accessories,
+    headless: data.headless === true,
+    korblox: data.korblox === true,
+    pose: typeof data.pose === "string" ? data.pose : "",
+  };
+}
+
 async function getUserAvatar(userId) {
   const response = await fetch(
     `${ROBLOX_AVATAR_API}/v2/avatar/users/${userId}/avatar`,
@@ -154,7 +203,7 @@ async function getUserAvatar(userId) {
       method: "GET",
       headers: {
         Accept: "application/json",
-        "User-Agent": "VeltrixAvatarRenderer/1.1",
+        "User-Agent": "VeltrixAvatarRenderer/2.0",
       },
       cache: "no-store",
     }
@@ -168,26 +217,14 @@ async function getUserAvatar(userId) {
 
   if (!response.ok) {
     throw new Error(
-      robloxErrorMessage(data, `Could not load the avatar (HTTP ${response.status})`)
+      robloxErrorMessage(
+        data,
+        `Could not load the avatar (HTTP ${response.status})`
+      )
     );
   }
 
   return data;
-}
-
-function makeBodyColors(avatar) {
-  const source = avatar?.bodyColor3s || avatar?.bodyColors || {};
-
-  return {
-    headColor: source.headColor3 || source.headColor || "#f5cba7",
-    torsoColor: source.torsoColor3 || source.torsoColor || "#f5cba7",
-    rightArmColor:
-      source.rightArmColor3 || source.rightArmColor || "#f5cba7",
-    leftArmColor: source.leftArmColor3 || source.leftArmColor || "#f5cba7",
-    rightLegColor:
-      source.rightLegColor3 || source.rightLegColor || "#f5cba7",
-    leftLegColor: source.leftLegColor3 || source.leftLegColor || "#f5cba7",
-  };
 }
 
 function safeNumber(value, fallback) {
@@ -208,37 +245,21 @@ function makeScales(avatar) {
   };
 }
 
-function makeAssets(avatar, extraAssetIds) {
-  const baseAssets = Array.isArray(avatar?.assets) ? avatar.assets : [];
-  const assets = [];
-  const seen = new Set();
+function makeBodyColors(avatar) {
+  const source = avatar?.bodyColor3s || avatar?.bodyColors || {};
 
-  for (const asset of baseAssets) {
-    const id = Number(asset?.id);
-
-    if (!Number.isSafeInteger(id) || id <= 0 || seen.has(id)) {
-      continue;
-    }
-
-    const output = { id };
-
-    // Layered clothing can rely on metadata such as order and puffiness.
-    if (asset.meta && typeof asset.meta === "object") {
-      output.meta = asset.meta;
-    }
-
-    assets.push(output);
-    seen.add(id);
-  }
-
-  for (const id of extraAssetIds) {
-    if (!seen.has(id)) {
-      assets.push({ id });
-      seen.add(id);
-    }
-  }
-
-  return assets;
+  return {
+    headColor: source.headColor3 || source.headColor || "#F5CBA7",
+    torsoColor: source.torsoColor3 || source.torsoColor || "#F5CBA7",
+    rightArmColor:
+      source.rightArmColor3 || source.rightArmColor || "#F5CBA7",
+    leftArmColor:
+      source.leftArmColor3 || source.leftArmColor || "#F5CBA7",
+    rightLegColor:
+      source.rightLegColor3 || source.rightLegColor || "#F5CBA7",
+    leftLegColor:
+      source.leftLegColor3 || source.leftLegColor || "#F5CBA7",
+  };
 }
 
 function getAvatarType(avatar) {
@@ -246,20 +267,88 @@ function getAvatarType(avatar) {
     return avatar.playerAvatarType;
   }
 
-  if (typeof avatar?.playerAvatarType?.playerAvatarType === "string") {
+  if (
+    typeof avatar?.playerAvatarType?.playerAvatarType === "string"
+  ) {
     return avatar.playerAvatarType.playerAvatarType;
   }
 
   return "R15";
 }
 
-function makeRenderPayload(avatar, extraAssetIds) {
-  // Keep this stable across polling attempts so Roblox checks the same render job.
-  const thumbnailId = Math.floor(Math.random() * 2_000_000_000) + 1;
+function normalizedAssetType(asset) {
+  return String(
+    asset?.assetType?.name || asset?.assetType || ""
+  )
+    .replace(/[\s_-]/g, "")
+    .toLowerCase();
+}
 
+function makeAssets(avatar, recipe) {
+  const baseAssets = Array.isArray(avatar?.assets)
+    ? avatar.assets
+    : [];
+  const output = [];
+  const seen = new Set();
+
+  const addAsset = (id, meta) => {
+    const numericId = Number(id);
+
+    if (
+      !Number.isSafeInteger(numericId) ||
+      numericId <= 0 ||
+      seen.has(numericId)
+    ) {
+      return;
+    }
+
+    const item = { id: numericId };
+
+    if (meta && typeof meta === "object") {
+      item.meta = meta;
+    }
+
+    output.push(item);
+    seen.add(numericId);
+  };
+
+  for (const asset of baseAssets) {
+    const type = normalizedAssetType(asset);
+
+    if (
+      recipe.headless &&
+      (type === "head" || type === "dynamichead")
+    ) {
+      continue;
+    }
+
+    if (recipe.korblox && type === "rightleg") {
+      continue;
+    }
+
+    addAsset(asset?.id, asset?.meta);
+  }
+
+  for (const id of recipe.accessories) {
+    addAsset(id);
+  }
+
+  if (recipe.headless) {
+    addAsset(HEADLESS_HEAD_ID);
+  }
+
+  if (recipe.korblox) {
+    addAsset(KORBLOX_RIGHT_LEG_ID);
+  }
+
+  return output;
+}
+
+function makeRenderPayload(avatar, recipe) {
   return {
     thumbnailConfig: {
-      thumbnailId,
+      thumbnailId:
+        Math.floor(Math.random() * 2_000_000_000) + 1,
       size: RENDER_SIZE,
       thumbnailType: "2d",
     },
@@ -269,7 +358,7 @@ function makeRenderPayload(avatar, extraAssetIds) {
       playerAvatarType: {
         playerAvatarType: getAvatarType(avatar),
       },
-      assets: makeAssets(avatar, extraAssetIds),
+      assets: makeAssets(avatar, recipe),
     },
   };
 }
@@ -283,52 +372,63 @@ async function postRender(
     Accept: "application/json",
     "Content-Type": "application/json",
     Cookie: robloxCookieHeader(),
-    "User-Agent": "VeltrixAvatarRenderer/1.1",
+    "User-Agent": "VeltrixAvatarRenderer/2.0",
   };
 
   if (cachedCsrfToken) {
     headers["x-csrf-token"] = cachedCsrfToken;
   }
 
-  const response = await fetch(`${ROBLOX_AVATAR_API}/v1/avatar/render`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-    cache: "no-store",
-  });
+  const response = await fetch(
+    `${ROBLOX_AVATAR_API}/v1/avatar/render`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      cache: "no-store",
+    }
+  );
 
-  const cookieRotated = captureRotatedRobloxCookie(response);
+  const cookieRotated = captureRotatedCookie(response);
 
-  // Roblox can rotate .ROBLOSECURITY through Set-Cookie.
-  if (response.status === 401 && allowCookieRetry && cookieRotated) {
+  if (
+    response.status === 401 &&
+    allowCookieRetry &&
+    cookieRotated
+  ) {
     cachedCsrfToken = "";
     return postRender(payload, allowCsrfRetry, false);
   }
 
   if (response.status === 403 && allowCsrfRetry) {
-    const newToken = response.headers.get("x-csrf-token");
+    const nextToken = response.headers.get("x-csrf-token");
 
-    if (!newToken) {
+    if (!nextToken) {
       const data = await readJson(response);
       throw new Error(
-        robloxErrorMessage(data, "Roblox rejected the cookie and gave no CSRF token")
+        robloxErrorMessage(
+          data,
+          "Roblox rejected the cookie and gave no CSRF token"
+        )
       );
     }
 
-    cachedCsrfToken = newToken;
+    cachedCsrfToken = nextToken;
     return postRender(payload, false, allowCookieRetry);
   }
 
   const data = await readJson(response);
 
   if (!response.ok) {
-    // The token may have expired while the function instance was warm.
     if (response.status === 403) {
       cachedCsrfToken = "";
     }
 
     throw new Error(
-      robloxErrorMessage(data, `Render request failed (HTTP ${response.status})`)
+      robloxErrorMessage(
+        data,
+        `Render request failed (HTTP ${response.status})`
+      )
     );
   }
 
@@ -336,18 +436,24 @@ async function postRender(
 }
 
 async function waitForCompletedRender(payload) {
-  let lastResult = null;
+  let lastState = "unknown";
 
-  for (let attempt = 1; attempt <= MAX_RENDER_ATTEMPTS; attempt += 1) {
-    lastResult = await postRender(payload);
+  for (
+    let attempt = 1;
+    attempt <= MAX_RENDER_ATTEMPTS;
+    attempt += 1
+  ) {
+    const result = await postRender(payload);
+    const state = String(result?.state || "").toLowerCase();
+    lastState = result?.state || "unknown";
 
-    if (lastResult?.state === "Completed" && lastResult?.imageUrl) {
-      return lastResult.imageUrl;
+    if (state === "completed" && result?.imageUrl) {
+      return result.imageUrl;
     }
 
-    if (!["Pending", "InReview"].includes(lastResult?.state)) {
+    if (state !== "pending" && state !== "inreview") {
       throw new Error(
-        `Roblox render failed with state: ${lastResult?.state || "unknown"}`
+        `Roblox render failed with state: ${lastState}`
       );
     }
 
@@ -355,17 +461,20 @@ async function waitForCompletedRender(payload) {
   }
 
   throw new Error(
-    `Roblox render timed out after ${MAX_RENDER_ATTEMPTS} attempts`
+    `Roblox render timed out with state: ${lastState}`
   );
 }
 
 async function downloadRenderedImage(imageUrl) {
   const parsedUrl = new URL(imageUrl);
+  const hostname = parsedUrl.hostname.toLowerCase();
 
-  // Prevents Roblox from making the backend fetch an arbitrary website.
   if (
     parsedUrl.protocol !== "https:" ||
-    !parsedUrl.hostname.toLowerCase().endsWith("rbxcdn.com")
+    !(
+      hostname === "rbxcdn.com" ||
+      hostname.endsWith(".rbxcdn.com")
+    )
   ) {
     throw new Error("Roblox returned an unexpected image host");
   }
@@ -374,13 +483,15 @@ async function downloadRenderedImage(imageUrl) {
     method: "GET",
     headers: {
       Accept: "image/png,image/webp,image/jpeg,*/*",
-      "User-Agent": "VeltrixAvatarRenderer/1.1",
+      "User-Agent": "VeltrixAvatarRenderer/2.0",
     },
     cache: "no-store",
   });
 
   if (!response.ok) {
-    throw new Error(`Could not download the rendered image (HTTP ${response.status})`);
+    throw new Error(
+      `Could not download the rendered image (HTTP ${response.status})`
+    );
   }
 
   const buffer = Buffer.from(await response.arrayBuffer());
@@ -391,26 +502,9 @@ async function downloadRenderedImage(imageUrl) {
 
   return {
     buffer,
-    contentType: response.headers.get("content-type") || "image/png",
+    contentType:
+      response.headers.get("content-type") || "image/png",
   };
-}
-
-function setCorsHeaders(res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, x-api-key");
-}
-
-function isAuthorized(req) {
-  const configuredKey = String(process.env.AVATAR_API_KEY || "");
-
-  // Refuse to run publicly if the owner forgot to configure a key.
-  if (!configuredKey) {
-    throw new Error("AVATAR_API_KEY is missing from Vercel environment variables");
-  }
-
-  const suppliedKey = String(req.headers["x-api-key"] || "");
-  return suppliedKey.length > 0 && suppliedKey === configuredKey;
 }
 
 export default async function handler(req, res) {
@@ -422,42 +516,53 @@ export default async function handler(req, res) {
 
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET, OPTIONS");
-    return res.status(405).json({ error: "Method not allowed" });
+    return res.status(405).json({
+      error: "Method not allowed",
+    });
   }
 
   try {
     if (!isAuthorized(req)) {
-      return res.status(401).json({ error: "Invalid or missing x-api-key" });
-    }
-
-    const userId = parsePositiveInteger(req.query.userId ?? req.query.userid);
-
-    if (!userId) {
-      return res.status(400).json({
-        error: "A valid userId query parameter is required",
+      return res.status(401).json({
+        error: "Invalid or missing x-api-key",
       });
     }
 
-    const accessoryIds = parseAccessoryIds(
-      req.query.accessories ?? req.query.assets
-    );
+    const avatarId = parseAvatarId(req.query.id);
 
-    const avatar = await getUserAvatar(userId);
-    const payload = makeRenderPayload(avatar, accessoryIds);
+    if (!avatarId) {
+      return res.status(400).json({
+        error: "A valid avatar ID is required",
+      });
+    }
+
+    const recipe = await loadSavedAvatar(avatarId);
+
+    if (!recipe) {
+      return res.status(404).json({
+        error: "Avatar ID not found",
+      });
+    }
+
+    const avatar = await getUserAvatar(recipe.userId);
+    const payload = makeRenderPayload(avatar, recipe);
     const imageUrl = await waitForCompletedRender(payload);
     const image = await downloadRenderedImage(imageUrl);
 
     res.setHeader("Content-Type", image.contentType);
     res.setHeader(
       "Content-Disposition",
-      `inline; filename="avatar-${userId}.png"`
+      `inline; filename="${avatarId}.png"`
     );
     res.setHeader("Cache-Control", "no-store");
-    res.setHeader("X-Avatar-Accessory-Count", String(accessoryIds.length));
+    res.setHeader("X-Avatar-ID", avatarId);
+    res.setHeader(
+      "X-Avatar-Accessory-Count",
+      String(recipe.accessories.length)
+    );
 
-    // The temporary render endpoint does not have a confirmed pose field.
-    if (firstValue(req.query.pose)) {
-      res.setHeader("X-Avatar-Pose", "ignored");
+    if (recipe.pose) {
+      res.setHeader("X-Avatar-Pose", "stored-but-not-rendered");
     }
 
     return res.status(200).send(image.buffer);
@@ -466,8 +571,14 @@ export default async function handler(req, res) {
 
     const message = String(error?.message || error || "Unknown error");
 
-    if (message.includes("ROBLOX_COOKIE") || message.includes("AVATAR_API_KEY")) {
-      return res.status(500).json({ error: message });
+    if (
+      message.includes("ROBLOX_COOKIE") ||
+      message.includes("AVATAR_API_KEY") ||
+      message.includes("SUPABASE_")
+    ) {
+      return res.status(500).json({
+        error: message,
+      });
     }
 
     if (
